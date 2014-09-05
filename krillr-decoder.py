@@ -7,16 +7,16 @@ Codebook = {
   '--..' : 'Z', '.----' : '1', '..---' : '2', '...--' : '3',
   '....-' : '4', '.....' : '5', '-....' : '6', '--...' : '7',
   '---..' : '8','----.' : '9','-----' : '0',
-  '-...-' : '=', '.-.-':'~', '.-...' :'<AS>', '.-.-.' : '<AR>', '...-.-' : '<SK>',
-  '-.--.' : '<KN>', '..-.-' : '<INT>', '....--' : '<HM>', '...-.' : '<VE>',
+  '-...-' : '=', '.-.-':'~', '.-...' :'*', '.-.-.' : '*', '...-.-' : '*',
+  '-.--.' : '*', '..-.-' : '*', '....--' : '*', '...-.' : '*',
   '.-..-.' : '\\', '.----.' : '\'', '...-..-' : '$', '-.--.' : '(', '-.--.-' : ')',
   '--..--' : ',', '-....-' : '-', '.-.-.-' : '.', '-..-.' : '/', '---...' : ':',
-  '-.-.-.' : ';', '..--..' : '?', '..--.-' : '_', '.--.-.' : '@', '-.-.--' : '!', '!': ' '
+  '-.-.-.' : ';', '..--..' : '?', '..--.-' : '_', '.--.-.' : '@', '-.-.--' : '!', '!': ' ', '*': '*'
 }
 
 from scipy.io import wavfile
 from numpy.fft import fft, fftfreq, ifft
-import numpy, sys, os
+import numpy, scipy, sys, os
 
 MORSE_FREQUENCY = 600
 
@@ -35,46 +35,57 @@ def apply_filters(transformed_signal, signal_frequencies, bandwidth=20):
 
   F_filtered = numpy.array([bandpass(x, freq) for x, freq in zip(transformed_signal, signal_frequencies)])
   f_filtered = ifft(F_filtered)
-  p = numpy.log10(numpy.abs(f_filtered))
-  power_threshhold = numpy.median(p)
-
-  def squelch(x, power):
-    if power <= power_threshhold:
-      return 0
-    return x
-
-  p_filtered = numpy.array([squelch(x, power) for freq, power in zip(f_filtered, p)])
 
   return f_filtered
 
-def process(fn, bandwidth_min=5, bandwidth_max=50, bandwidth_step=5, segmentSize=30):
+def process(fn, bandwidth_min=5, bandwidth_max=50, bandwidth_step=5, segment_size=30, chunk_size=5):
   sample_rate, signal = wavfile.read(fn)
-  transformed_signal, signal_frequencies = transform(signal, sample_rate)
-  
+  chunk_size = chunk_size * sample_rate
+
+  predictions = []
+
   for bandwidth in range(bandwidth_max, bandwidth_min, -1*bandwidth_step):
-    filtered_signal = apply_filters(transformed_signal, signal_frequencies, bandwidth)
+    prediction = ''
+    remainder = ''
+    for x in range(0, len(signal), chunk_size):
+      chunk = signal[x:x+chunk_size]
+      if not len(chunk): break
 
-    samples = sample_signal(filtered_signal, segmentSize)
-    groups = group_samples(samples)
-
-    tones = [x[1] for x in groups if x[0]]
-    pauses = [x[1] for x in groups if not x[0]]
-
-    tonetype = numpy.mean(tones)
-    charbreak = numpy.mean(pauses)
-    
-    wordbreak = numpy.mean([x for x in pauses if x > charbreak])
-
-    prediction = predict(groups, tonetype, charbreak, wordbreak)
-
+      chunk_prediction, remainder = process_chunk(chunk, sample_rate, bandwidth, segment_size, remainder)
+      prediction += chunk_prediction
+    if remainder and remainder in Codebook:
+      prediction += Codebook[remainder]
+    prediction = prediction.replace(' ','')
+    predictions.append(prediction)
     if len(prediction) == 20:
       return prediction
 
-def sample_signal(data, segmentSize):
+  predictions.sort(key=lambda x:abs(20-len(x)))
+  return predictions[0]
+
+def process_chunk(chunk, sample_rate, bandwidth, segment_size, remainder):
+  transformed_signal, signal_frequencies = transform(chunk, sample_rate)
+  
+  filtered_signal = apply_filters(transformed_signal, signal_frequencies, bandwidth)
+
+  samples = sample_signal(filtered_signal, segment_size)
+  groups = group_samples(samples)
+
+  tones = [x[1] for x in groups if x[0]]
+  pauses = [x[1] for x in groups if not x[0]]
+
+  tonetype = numpy.mean(tones)
+  charbreak = numpy.mean(pauses) + numpy.std(pauses)*0.5
+  wordbreak = numpy.mean([x for x in pauses if x > charbreak])
+
+  prediction = predict(groups, tonetype, charbreak, wordbreak, remainder)
+  return prediction
+
+def sample_signal(data, segment_size):
   samples = []
 
-  for x in range(0, len(data), segmentSize):
-    samples.append(numpy.std(data[x:x+segmentSize]))
+  for x in range(0, len(data), segment_size):
+    samples.append(numpy.std(data[x:x+segment_size]))
 
   threshhold = numpy.mean(samples)
   for x in range(len(samples)):
@@ -92,8 +103,9 @@ def group_samples(samples):
     if (is_tone and samples[x]) or (not is_tone and not samples[x]):
       length += 1
     if length and ((is_tone and not samples[x]) or (not is_tone and samples[x])):
-      groups.append((is_tone, length))
-      length = 1
+      if length >= 3:
+        groups.append((is_tone, length))
+      length = 0
     is_tone = bool(samples[x])
 
   return groups
@@ -104,9 +116,8 @@ def ranged_process(fn):
     if len(response) == 20:
       return response
 
-def predict(groups, tonetype, charbreak, wordbreak):
+def predict(groups, tonetype, charbreak, wordbreak, c=''):
   message = []
-  c = ''
   for is_tone, length in groups:
     if is_tone:
       if length < tonetype:
@@ -127,7 +138,8 @@ def predict(groups, tonetype, charbreak, wordbreak):
               message.append(_c)
               break
           if len(c) == 6:
-            return ''
+            message.append('*')
+            c = ''
     elif length >= wordbreak and (message or c):
       message.append(c)
       message.append('!')
@@ -136,16 +148,17 @@ def predict(groups, tonetype, charbreak, wordbreak):
       if c:
         message.append(c)
         c = ''
-  if c: message.append(c)
-
   s = ''.join([Codebook[x] for x in message if x in Codebook])
-  return s
+  return s, c
 
 if __name__ == '__main__':
   import csv
-  writer = csv.writer(sys.stdout)
+  f = open("results.csv", 'w')
+  writer = csv.writer(f)
   writer.writerow(['ID','Prediction'])
+  f.flush()
   for x in range(1,201):
     if not os.path.exists("audio/cw%s.wav" % str(x).zfill(3)): continue
     response = process("audio/cw%s.wav" % str(x).zfill(3))
     writer.writerow([str(x), response])
+    f.flush()
